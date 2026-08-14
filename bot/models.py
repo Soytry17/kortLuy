@@ -20,6 +20,20 @@ class Base(DeclarativeBase):
     pass
 
 
+class CategoryBudget(Base):
+    __tablename__ = "category_budgets"
+    __table_args__ = (
+        UniqueConstraint("user_id", "category_id", name="uq_budget_user_category"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    category_id: Mapped[int] = mapped_column(ForeignKey("categories.id"), index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+
+    category: Mapped["Category"] = relationship("Category")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -28,6 +42,7 @@ class User(Base):
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Phnom_Penh")
     remind_at: Mapped[str] = mapped_column(String(5), default="21:00")
     currency: Mapped[str] = mapped_column(String(8), default="USD")
+    khr_rate: Mapped[int] = mapped_column(Integer, default=4100)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

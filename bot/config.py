@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 DEFAULT_TZ = "Asia/Phnom_Penh"
 DEFAULT_REMIND_AT = "21:00"
 DEFAULT_CURRENCY = "USD"
+DEFAULT_KHR_RATE = 4100
 _ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 

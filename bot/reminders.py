@@ -10,7 +10,7 @@ from telegram.ext import Application, ContextTypes
 
 from bot.db import get_or_create_user, session_scope
 from bot.models import User
-from bot.reports import count_on_date, local_today
+from bot.reports import build_period_report, count_on_date, local_today
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,65 @@ def schedule_all_reminders(application: Application) -> None:
         snapshot = [(u.telegram_id, u.remind_at, u.timezone) for u in users]
     for telegram_id, remind_at, timezone_name in snapshot:
         schedule_user_reminder(application, telegram_id, remind_at, timezone_name)
+
+
+def schedule_user_weekly_summary(
+    application: Application,
+    telegram_id: int,
+    timezone_name: str,
+) -> None:
+    job_queue = application.job_queue
+    if job_queue is None:
+        logger.warning("JobQueue is not available; weekly summary disabled")
+        return
+
+    name = f"weekly_{telegram_id}"
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+    tz = ZoneInfo(timezone_name)
+    job_queue.run_daily(
+        send_weekly_summary,
+        time=dtime(hour=20, minute=0, tzinfo=tz),
+        chat_id=telegram_id,
+        name=name,
+        data={"telegram_id": telegram_id, "timezone": timezone_name},
+    )
+    logger.info("Scheduled weekly summary for %s (%s)", telegram_id, timezone_name)
+
+
+def schedule_all_weekly_summaries(application: Application) -> None:
+    with session_scope() as session:
+        users = list(session.scalars(select(User)))
+        snapshot = [(u.telegram_id, u.timezone) for u in users]
+    for telegram_id, timezone_name in snapshot:
+        schedule_user_weekly_summary(application, telegram_id, timezone_name)
+
+
+async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    if job is None or job.chat_id is None:
+        return
+    telegram_id = int(job.chat_id)
+    timezone_name = "Asia/Phnom_Penh"
+    if job.data and isinstance(job.data, dict):
+        timezone_name = str(job.data.get("timezone") or timezone_name)
+
+    today = local_today(timezone_name)
+    if today.weekday() != 6:  # 6 = Sunday in Python's datetime
+        return
+
+    with session_scope() as session:
+        user = get_or_create_user(session, telegram_id)
+        report = build_period_report(
+            session, user.id, "week", user.timezone, user.currency
+        )
+
+    await context.bot.send_message(
+        chat_id=telegram_id,
+        text=f"<b>Weekly Summary</b>\n\n{report}",
+        parse_mode="HTML",
+    )
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:

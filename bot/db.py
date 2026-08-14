@@ -6,10 +6,10 @@ from datetime import date
 from pathlib import Path
 
 from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, joinedload, sessionmaker
 
-from bot.config import DEFAULT_CURRENCY, DEFAULT_REMIND_AT, DEFAULT_TZ, get_settings
-from bot.models import Category, Transaction, User
+from bot.config import DEFAULT_CURRENCY, DEFAULT_REMIND_AT, DEFAULT_TZ, DEFAULT_KHR_RATE, get_settings
+from bot.models import Category, CategoryBudget, Transaction, User
 
 DEFAULT_EXPENSE_CATEGORIES = [
     "food",
@@ -107,6 +107,7 @@ def get_or_create_user(session: Session, telegram_id: int) -> User:
             timezone=settings.tz or DEFAULT_TZ,
             remind_at=DEFAULT_REMIND_AT,
             currency=DEFAULT_CURRENCY,
+            khr_rate=DEFAULT_KHR_RATE,
         )
         session.add(user)
         session.flush()
@@ -173,4 +174,94 @@ def last_transaction(session: Session, user_id: int) -> Transaction | None:
         .where(Transaction.user_id == user_id)
         .order_by(Transaction.created_at.desc(), Transaction.id.desc())
         .limit(1)
+    )
+
+
+def recent_transactions(
+    session: Session, user_id: int, limit: int = 10
+) -> list[Transaction]:
+    return list(
+        session.scalars(
+            select(Transaction)
+            .where(Transaction.user_id == user_id)
+            .options(joinedload(Transaction.category))
+            .order_by(Transaction.occurred_on.desc(), Transaction.created_at.desc())
+            .limit(limit)
+        ).unique()
+    )
+
+
+def get_transaction(session: Session, tx_id: int, user_id: int) -> Transaction | None:
+    return session.scalar(
+        select(Transaction)
+        .where(Transaction.id == tx_id, Transaction.user_id == user_id)
+        .options(joinedload(Transaction.category))
+    )
+
+
+# ── Budget helpers ─────────────────────────────────────────────────────────────
+
+def set_budget(
+    session: Session, user_id: int, category_id: int, amount_cents: int
+) -> CategoryBudget:
+    budget = session.scalar(
+        select(CategoryBudget).where(
+            CategoryBudget.user_id == user_id,
+            CategoryBudget.category_id == category_id,
+        )
+    )
+    if budget is None:
+        budget = CategoryBudget(
+            user_id=user_id, category_id=category_id, amount_cents=amount_cents
+        )
+        session.add(budget)
+    else:
+        budget.amount_cents = amount_cents
+    session.flush()
+    return budget
+
+
+def get_budget(
+    session: Session, user_id: int, category_id: int
+) -> CategoryBudget | None:
+    return session.scalar(
+        select(CategoryBudget).where(
+            CategoryBudget.user_id == user_id,
+            CategoryBudget.category_id == category_id,
+        )
+    )
+
+
+def list_budgets(session: Session, user_id: int) -> list[CategoryBudget]:
+    return list(
+        session.scalars(
+            select(CategoryBudget)
+            .where(CategoryBudget.user_id == user_id)
+            .options(joinedload(CategoryBudget.category))
+        )
+    )
+
+
+def delete_budget(session: Session, user_id: int, category_id: int) -> bool:
+    budget = get_budget(session, user_id, category_id)
+    if budget is None:
+        return False
+    session.delete(budget)
+    return True
+
+
+def month_spending_for_category(
+    session: Session, user_id: int, category_id: int, start: date, end: date
+) -> int:
+    return int(
+        session.scalar(
+            select(func.coalesce(func.sum(Transaction.amount_cents), 0)).where(
+                Transaction.user_id == user_id,
+                Transaction.category_id == category_id,
+                Transaction.kind == "expense",
+                Transaction.occurred_on >= start,
+                Transaction.occurred_on <= end,
+            )
+        )
+        or 0
     )

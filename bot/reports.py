@@ -32,14 +32,25 @@ def period_range(period: str, timezone_name: str) -> tuple[date, date]:
 
 def period_title(period: str, start: date, end: date) -> str:
     if period == "today":
-        return f"Today ({_fmt_date(end)})"
+        return f"Today  •  {_fmt_date(end)}"
     if period == "week":
-        return f"This week ({_fmt_date(start)} – {_fmt_date(end)})"
-    return f"This month ({end.strftime('%B %Y')})"
+        if start.month == end.month:
+            return f"This week  •  {start.day}–{_fmt_date(end)}"
+        return f"This week  •  {_fmt_date(start)} – {_fmt_date(end)}"
+    return f"This month  •  {end.strftime('%B %Y')}"
 
 
 def _fmt_date(value: date) -> str:
     return value.strftime("%d %b %Y")
+
+
+def _fmt_short(value: date) -> str:
+    return value.strftime("%d %b")
+
+
+def _bar(pct: int, width: int = 8) -> str:
+    filled = min(pct, 100) * width // 100
+    return "█" * filled + "░" * (width - filled)
 
 
 def fetch_transactions(
@@ -99,47 +110,59 @@ def build_period_report(
     income = sum(tx.amount_cents for tx in txs if tx.kind == "income")
     expense = sum(tx.amount_cents for tx in txs if tx.kind == "expense")
     net = income - expense
+    net_sign = "+" if net >= 0 else ""
 
     lines = [
         f"<b>{escape(period_title(period, start, end))}</b>",
         "",
-        f"Income: {format_money(income, currency)}",
-        f"Expense: {format_money(expense, currency)}",
-        f"Net: {format_money(net, currency)}",
+        f"  Income    <b>{format_money(income, currency)}</b>",
+        f"  Expense   <b>{format_money(expense, currency)}</b>",
+        f"  Net       <b>{net_sign}{format_money(net, currency)}</b>",
     ]
 
     if not txs:
-        lines += ["", "No transactions yet."]
+        lines += ["", "<i>No transactions yet.</i>"]
         return "\n".join(lines)
 
+    # ── By category ────────────────────────────────────────────────────────
     by_cat: dict[tuple[str, str], int] = defaultdict(int)
     for tx in txs:
         name = tx.category.name if tx.category else "uncategorized"
         by_cat[(tx.kind, name)] += tx.amount_cents
 
-    lines += ["", "<b>By category</b>"]
-    for kind in ("income", "expense"):
+    lines += ["", "<b>Breakdown</b>"]
+    for kind, kind_total in (("income", income), ("expense", expense)):
         items = sorted(
             ((name, total) for (k, name), total in by_cat.items() if k == kind),
             key=lambda item: (-item[1], item[0]),
         )
         if not items:
             continue
-        lines.append(f"{kind.title()}")
+        lines.append(f"<i>{kind.title()}</i>")
         for name, total in items:
-            lines.append(f"  {escape(name)}: {format_money(total, currency)}")
+            pct = int(total / kind_total * 100) if kind_total else 0
+            bar = _bar(pct)
+            lines.append(
+                f"  <code>{escape(name):<14}</code>"
+                f" {format_money(total, currency):>10}"
+                f"  {bar}  {pct}%"
+            )
 
-    lines += ["", "<b>Entries</b>"]
+    # ── Entries ────────────────────────────────────────────────────────────
+    count = len(txs)
+    lines += ["", f"<b>Entries</b>  <i>({count})</i>"]
     for tx in txs[:40]:
         sign = "+" if tx.kind == "income" else "-"
         cat = tx.category.name if tx.category else "uncategorized"
-        note = f" — {escape(tx.note)}" if tx.note else ""
+        note = f"  <i>{escape(tx.note)}</i>" if tx.note else ""
         lines.append(
-            f"{_fmt_date(tx.occurred_on)} {sign}{format_money(tx.amount_cents, currency)} "
-            f"{escape(cat)}{note}"
+            f"  <code>{_fmt_short(tx.occurred_on)}</code>"
+            f"  {sign}{format_money(tx.amount_cents, currency)}"
+            f"  {escape(cat)}{note}"
         )
-    if len(txs) > 40:
-        lines.append(f"…and {len(txs) - 40} more. Use /export for the full list.")
+    if count > 40:
+        lines.append(f"  <i>…and {count - 40} more. Use /export for the full list.</i>")
+
     return "\n".join(lines)
 
 
@@ -148,13 +171,14 @@ def build_balance_report(
 ) -> str:
     income, expense = sum_by_kind(session, user_id)
     net = income - expense
+    net_sign = "+" if net >= 0 else ""
     return "\n".join(
         [
             "<b>All-time balance</b>",
             "",
-            f"Income: {format_money(income, currency)}",
-            f"Expense: {format_money(expense, currency)}",
-            f"Balance: {format_money(net, currency)}",
+            f"  Income    <b>{format_money(income, currency)}</b>",
+            f"  Expense   <b>{format_money(expense, currency)}</b>",
+            f"  Balance   <b>{net_sign}{format_money(net, currency)}</b>",
         ]
     )
 
