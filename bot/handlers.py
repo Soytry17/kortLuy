@@ -182,6 +182,17 @@ def delete_category_keyboard(
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
 
 
+async def safe_answer(query: object) -> None:
+    """Answer a callback query, ignoring 'query too old' errors from free-tier spin-down."""
+    try:
+        from telegram import CallbackQuery
+        if isinstance(query, CallbackQuery):
+            await safe_answer(query)
+    except BadRequest as e:
+        if "query is too old" not in str(e).lower():
+            raise
+
+
 async def reply(
     update: Update,
     text: str,
@@ -361,7 +372,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     if update.callback_query:
-        await update.callback_query.answer()
+        await safe_answer(update.callback_query)
         await reply(update, "Cancelled.", main_keyboard(), edit=True)
     else:
         await reply(update, "Cancelled.", main_keyboard())
@@ -382,7 +393,7 @@ async def income_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def start_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     kind = query.data.split(":", 1)[1]
     context.user_data.clear()
     context.user_data["kind"] = kind
@@ -472,7 +483,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     category_id = int(query.data.split(":", 1)[1])
     context.user_data["category_id"] = category_id
     pending = context.user_data.get("pending_note")
@@ -529,7 +540,7 @@ async def note_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def note_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None
-    await query.answer()
+    await safe_answer(query)
     category_id = int(context.user_data["category_id"])
     with session_scope() as session:
         return await _save_transaction(update, context, session, category_id, None)
@@ -619,7 +630,7 @@ async def _send_period(
     update: Update, context: ContextTypes.DEFAULT_TYPE, period: str
 ) -> None:
     if update.callback_query:
-        await update.callback_query.answer()
+        await safe_answer(update.callback_query)
     assert update.effective_user is not None
     _maybe_schedule(context, update.effective_user.id)
     with session_scope() as session:
@@ -633,7 +644,7 @@ async def _send_period(
 @allowed_only
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.callback_query:
-        await update.callback_query.answer()
+        await safe_answer(update.callback_query)
     assert update.effective_user is not None
     _maybe_schedule(context, update.effective_user.id)
     with session_scope() as session:
@@ -665,7 +676,7 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @allowed_only
 async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.callback_query:
-        await update.callback_query.answer()
+        await safe_answer(update.callback_query)
     assert update.effective_user is not None
     with session_scope() as session:
         user = get_or_create_user(session, update.effective_user.id)
@@ -686,7 +697,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a CSV backup of all transactions on demand."""
     if update.callback_query:
-        await update.callback_query.answer()
+        await safe_answer(update.callback_query)
     assert update.effective_user is not None
     with session_scope() as session:
         user = get_or_create_user(session, update.effective_user.id)
@@ -813,7 +824,7 @@ async def _delete_category(update: Update, session, category: Category) -> None:
 async def delete_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     category_id = int(query.data.split(":", 1)[1])
     with session_scope() as session:
         category = session.get(Category, category_id)
@@ -869,7 +880,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await export_cmd(update, context)
     elif action == "budget":
         if update.callback_query:
-            await update.callback_query.answer()
+            await safe_answer(update.callback_query)
         await _show_budget_overview(update, edit=True)
     elif action == "trends":
         await trends_cmd(update, context)
@@ -877,7 +888,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await goals_cmd(update, context)
     elif action == "back":
         if update.callback_query:
-            await update.callback_query.answer()
+            await safe_answer(update.callback_query)
         await start(update, context)
 
 
@@ -957,7 +968,7 @@ async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def edit_pick_tx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     tx_id = int(query.data.split(":", 1)[1])
     context.user_data["edit_tx_id"] = tx_id
     with session_scope() as session:
@@ -981,7 +992,7 @@ async def edit_pick_tx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     field = query.data.split(":", 1)[1]
 
     if field == "cancel":
@@ -1060,7 +1071,7 @@ async def edit_new_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def edit_new_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     assert update.effective_user is not None
     tx_id = int(context.user_data["edit_tx_id"])
     category_id = int(query.data.split(":", 1)[1])
@@ -1097,7 +1108,7 @@ async def edit_new_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def edit_note_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None
-    await query.answer()
+    await safe_answer(query)
     assert update.effective_user is not None
     tx_id = int(context.user_data["edit_tx_id"])
     with session_scope() as session:
@@ -1175,7 +1186,7 @@ async def budget_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Entry: user tapped Today / Week / Month to set a budget."""
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     period = query.data.split(":", 1)[1]
     context.user_data["bperiod"] = period
 
@@ -1230,7 +1241,7 @@ async def budget_amount_received(update: Update, context: ContextTypes.DEFAULT_T
 async def budget_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     period = query.data.split(":", 1)[1]
     context.user_data.pop("bperiod", None)
 
@@ -1250,7 +1261,7 @@ async def budget_period_callback(update: Update, context: ContextTypes.DEFAULT_T
     """Handles cancel → return to budget overview."""
     query = update.callback_query
     assert query is not None
-    await query.answer()
+    await safe_answer(query)
     await _show_budget_overview(update, edit=True)
 
 
@@ -1259,7 +1270,7 @@ async def budget_period_callback(update: Update, context: ContextTypes.DEFAULT_T
 @allowed_only
 async def trends_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.callback_query:
-        await update.callback_query.answer()
+        await safe_answer(update.callback_query)
     assert update.effective_user is not None
 
     with session_scope() as session:
@@ -1377,7 +1388,7 @@ def _goals_keyboard(goals: list) -> InlineKeyboardMarkup:
 @allowed_only
 async def goals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.callback_query:
-        await update.callback_query.answer()
+        await safe_answer(update.callback_query)
     await _show_goals(update)
 
 
@@ -1422,7 +1433,7 @@ async def _show_goals(update: Update, edit: bool = False) -> None:
 async def goal_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None
-    await query.answer()
+    await safe_answer(query)
     await reply(
         update,
         "Enter a name for your goal (e.g. <code>Vacation</code>):",
@@ -1472,7 +1483,7 @@ async def goal_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
 async def goal_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     assert update.effective_user is not None
     goal_id = int(query.data.split(":", 1)[1])
     with session_scope() as session:
@@ -1485,7 +1496,7 @@ async def goal_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def goal_deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     assert query is not None and query.data is not None
-    await query.answer()
+    await safe_answer(query)
     goal_id = int(query.data.split(":", 1)[1])
     context.user_data["deposit_goal_id"] = goal_id
     assert update.effective_user is not None
