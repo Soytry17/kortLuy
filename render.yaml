@@ -5,6 +5,7 @@ services:
     buildCommand: pip install -r requirements.txt && python -m alembic upgrade head
     startCommand: python -m bot.main
     plan: free
+    pythonVersion: "3.11.9"
     envVars:
       - key: BOT_TOKEN
         sync: false          # you fill this in the Render dashboard
