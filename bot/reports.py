@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
+from bot.db import income_expense_for_period
 from bot.models import Transaction
 from bot.money import format_money
 
@@ -111,13 +112,15 @@ def build_period_report(
     expense = sum(tx.amount_cents for tx in txs if tx.kind == "expense")
     net = income - expense
     net_sign = "+" if net >= 0 else ""
+    net_emoji = "📈" if net >= 0 else "📉"
 
     lines = [
         f"<b>{escape(period_title(period, start, end))}</b>",
-        "",
-        f"  Income    <b>{format_money(income, currency)}</b>",
-        f"  Expense   <b>{format_money(expense, currency)}</b>",
-        f"  Net       <b>{net_sign}{format_money(net, currency)}</b>",
+        f"<code>{'─' * 30}</code>",
+        f"  💰 Income    <b>{format_money(income, currency)}</b>",
+        f"  💸 Expense   <b>{format_money(expense, currency)}</b>",
+        f"  {net_emoji} Net       <b>{net_sign}{format_money(net, currency)}</b>",
+        f"<code>{'─' * 30}</code>",
     ]
 
     if not txs:
@@ -138,27 +141,28 @@ def build_period_report(
         )
         if not items:
             continue
-        lines.append(f"<i>{kind.title()}</i>")
+        icon = "💰" if kind == "income" else "💸"
+        lines.append(f"{icon} <i>{kind.title()}</i>")
         for name, total in items:
             pct = int(total / kind_total * 100) if kind_total else 0
             bar = _bar(pct)
             lines.append(
                 f"  <code>{escape(name):<14}</code>"
-                f" {format_money(total, currency):>10}"
-                f"  {bar}  {pct}%"
+                f" <b>{format_money(total, currency):>9}</b>"
+                f"  {bar} {pct}%"
             )
 
     # ── Entries ────────────────────────────────────────────────────────────
     count = len(txs)
     lines += ["", f"<b>Entries</b>  <i>({count})</i>"]
     for tx in txs[:40]:
-        sign = "+" if tx.kind == "income" else "-"
+        icon = "➕" if tx.kind == "income" else "➖"
         cat = tx.category.name if tx.category else "uncategorized"
         note = f"  <i>{escape(tx.note)}</i>" if tx.note else ""
         lines.append(
-            f"  <code>{_fmt_short(tx.occurred_on)}</code>"
-            f"  {sign}{format_money(tx.amount_cents, currency)}"
-            f"  {escape(cat)}{note}"
+            f"  {icon} <code>{_fmt_short(tx.occurred_on)}</code>"
+            f"  <b>{format_money(tx.amount_cents, currency)}</b>"
+            f"  <i>{escape(cat)}</i>{note}"
         )
     if count > 40:
         lines.append(f"  <i>…and {count - 40} more. Use /export for the full list.</i>")
@@ -181,6 +185,146 @@ def build_balance_report(
             f"  Balance   <b>{net_sign}{format_money(net, currency)}</b>",
         ]
     )
+
+
+def _pct_change(curr: int, prev: int) -> str:
+    if prev == 0:
+        return "new" if curr > 0 else "—"
+    pct = int((curr - prev) / prev * 100)
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct}%"
+
+
+def _trend_row(label: str, curr: int, prev: int, currency: str) -> str:
+    diff = curr - prev
+    sign = "+" if diff >= 0 else ""
+    pct = _pct_change(curr, prev)
+    return (
+        f"  {label:<10}"
+        f"  {format_money(curr, currency):>10}"
+        f"  vs  {format_money(prev, currency):>10}"
+        f"  ({sign}{format_money(diff, currency)}  {pct})"
+    )
+
+
+def build_trends_report(
+    session: Session, user_id: int, timezone_name: str, currency: str
+) -> str:
+    today = local_today(timezone_name)
+
+    # This week / last week
+    week_start = today - timedelta(days=today.weekday())
+    last_week_end = week_start - timedelta(days=1)
+    last_week_start = last_week_end - timedelta(days=6)
+
+    w_inc, w_exp = income_expense_for_period(session, user_id, week_start, today)
+    lw_inc, lw_exp = income_expense_for_period(session, user_id, last_week_start, last_week_end)
+
+    # This month / last month
+    month_start = today.replace(day=1)
+    last_month_end = month_start - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+
+    m_inc, m_exp = income_expense_for_period(session, user_id, month_start, today)
+    lm_inc, lm_exp = income_expense_for_period(session, user_id, last_month_start, last_month_end)
+
+    lines = ["<b>Trends</b>", ""]
+
+    lines.append(
+        f"<b>This week</b>  vs  <b>Last week</b>\n"
+        f"  <i>({_fmt_date(week_start)} – {_fmt_date(today)}"
+        f"  vs  {_fmt_date(last_week_start)} – {_fmt_date(last_week_end)})</i>"
+    )
+    lines.append(_trend_row("Income", w_inc, lw_inc, currency))
+    lines.append(_trend_row("Expense", w_exp, lw_exp, currency))
+    lines.append(_trend_row("Net", w_inc - w_exp, lw_inc - lw_exp, currency))
+
+    lines.append("")
+    lines.append(
+        f"<b>This month</b>  vs  <b>Last month</b>\n"
+        f"  <i>({today.strftime('%B %Y')}  vs  {last_month_end.strftime('%B %Y')})</i>"
+    )
+    lines.append(_trend_row("Income", m_inc, lm_inc, currency))
+    lines.append(_trend_row("Expense", m_exp, lm_exp, currency))
+    lines.append(_trend_row("Net", m_inc - m_exp, lm_inc - lm_exp, currency))
+
+    return "\n".join(lines)
+
+
+def parse_date_input(text: str, current_year: int) -> date | None:
+    """Parse DD/MM/YYYY, DD/MM, or YYYY-MM-DD."""
+    text = text.strip()
+    for fmt in ("%d/%m/%Y", "%d/%m", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            d = datetime.strptime(text, fmt).date()
+            if fmt == "%d/%m":
+                d = d.replace(year=current_year)
+            return d
+        except ValueError:
+            continue
+    return None
+
+
+def build_custom_range_report(
+    session: Session,
+    user_id: int,
+    start: date,
+    end: date,
+    timezone_name: str,
+    currency: str,
+) -> str:
+    if start > end:
+        start, end = end, start
+    txs = fetch_transactions(session, user_id, start, end)
+    income = sum(tx.amount_cents for tx in txs if tx.kind == "income")
+    expense = sum(tx.amount_cents for tx in txs if tx.kind == "expense")
+    net = income - expense
+    net_sign = "+" if net >= 0 else ""
+
+    lines = [
+        f"<b>{_fmt_date(start)} – {_fmt_date(end)}</b>",
+        "",
+        f"  Income    <b>{format_money(income, currency)}</b>",
+        f"  Expense   <b>{format_money(expense, currency)}</b>",
+        f"  Net       <b>{net_sign}{format_money(net, currency)}</b>",
+    ]
+
+    if not txs:
+        lines += ["", "<i>No transactions in this range.</i>"]
+        return "\n".join(lines)
+
+    from collections import defaultdict
+    by_cat: dict[tuple[str, str], int] = defaultdict(int)
+    for tx in txs:
+        name = tx.category.name if tx.category else "uncategorized"
+        by_cat[(tx.kind, name)] += tx.amount_cents
+
+    lines += ["", "<b>Breakdown</b>"]
+    for kind, total in (("income", income), ("expense", expense)):
+        items = sorted(
+            ((n, t) for (k, n), t in by_cat.items() if k == kind),
+            key=lambda x: -x[1],
+        )
+        if items:
+            lines.append(f"<i>{kind.title()}</i>")
+            for name, amt in items:
+                pct = int(amt / total * 100) if total else 0
+                lines.append(f"  {escape(name):<14}  {format_money(amt, currency):>10}  {pct}%")
+
+    lines += ["", f"<b>Entries</b>  <i>({len(txs)})</i>"]
+    for tx in txs[:40]:
+        sign = "+" if tx.kind == "income" else "-"
+        cat = tx.category.name if tx.category else "uncategorized"
+        note = f"  <i>{escape(tx.note)}</i>" if tx.note else ""
+        lines.append(
+            f"  <code>{_fmt_short(tx.occurred_on)}</code>"
+            f"  {sign}{format_money(tx.amount_cents, currency)}"
+            f"  {escape(cat)}{note}"
+        )
+    if len(txs) > 40:
+        lines.append(f"  <i>…and {len(txs) - 40} more. Use /export for the full list.</i>")
+
+    return "\n".join(lines)
 
 
 def build_csv(session: Session, user_id: int) -> bytes:

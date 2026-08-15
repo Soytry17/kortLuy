@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from bot.config import DEFAULT_CURRENCY, DEFAULT_REMIND_AT, DEFAULT_TZ, DEFAULT_KHR_RATE, get_settings
-from bot.models import Category, CategoryBudget, Transaction, User
+from bot.models import Category, CategoryBudget, SavingsGoal, Transaction, User
 
 DEFAULT_EXPENSE_CATEGORIES = [
     "food",
@@ -202,17 +202,25 @@ def get_transaction(session: Session, tx_id: int, user_id: int) -> Transaction |
 # ── Budget helpers ─────────────────────────────────────────────────────────────
 
 def set_budget(
-    session: Session, user_id: int, category_id: int, amount_cents: int
+    session: Session,
+    user_id: int,
+    category_id: int,
+    amount_cents: int,
+    period: str = "month",
 ) -> CategoryBudget:
     budget = session.scalar(
         select(CategoryBudget).where(
             CategoryBudget.user_id == user_id,
             CategoryBudget.category_id == category_id,
+            CategoryBudget.period == period,
         )
     )
     if budget is None:
         budget = CategoryBudget(
-            user_id=user_id, category_id=category_id, amount_cents=amount_cents
+            user_id=user_id,
+            category_id=category_id,
+            amount_cents=amount_cents,
+            period=period,
         )
         session.add(budget)
     else:
@@ -222,35 +230,43 @@ def set_budget(
 
 
 def get_budget(
-    session: Session, user_id: int, category_id: int
+    session: Session, user_id: int, category_id: int, period: str = "month"
 ) -> CategoryBudget | None:
     return session.scalar(
         select(CategoryBudget).where(
             CategoryBudget.user_id == user_id,
             CategoryBudget.category_id == category_id,
+            CategoryBudget.period == period,
         )
     )
 
 
-def list_budgets(session: Session, user_id: int) -> list[CategoryBudget]:
+def list_budgets(
+    session: Session, user_id: int, period: str = "month"
+) -> list[CategoryBudget]:
     return list(
         session.scalars(
             select(CategoryBudget)
-            .where(CategoryBudget.user_id == user_id)
+            .where(
+                CategoryBudget.user_id == user_id,
+                CategoryBudget.period == period,
+            )
             .options(joinedload(CategoryBudget.category))
         )
     )
 
 
-def delete_budget(session: Session, user_id: int, category_id: int) -> bool:
-    budget = get_budget(session, user_id, category_id)
+def delete_budget(
+    session: Session, user_id: int, category_id: int, period: str = "month"
+) -> bool:
+    budget = get_budget(session, user_id, category_id, period)
     if budget is None:
         return False
     session.delete(budget)
     return True
 
 
-def month_spending_for_category(
+def period_spending_for_category(
     session: Session, user_id: int, category_id: int, start: date, end: date
 ) -> int:
     return int(
@@ -265,3 +281,89 @@ def month_spending_for_category(
         )
         or 0
     )
+
+
+# Keep old name as alias so existing callers don't break
+month_spending_for_category = period_spending_for_category
+
+
+def income_expense_for_period(
+    session: Session, user_id: int, start: date, end: date
+) -> tuple[int, int]:
+    """Returns (income_cents, expense_cents) for the given period."""
+    rows = session.execute(
+        select(Transaction.kind, func.coalesce(func.sum(Transaction.amount_cents), 0))
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.occurred_on >= start,
+            Transaction.occurred_on <= end,
+        )
+        .group_by(Transaction.kind)
+    ).all()
+    income, expense = 0, 0
+    for kind, total in rows:
+        if kind == "income":
+            income = int(total)
+        else:
+            expense = int(total)
+    return income, expense
+
+
+def total_expense_for_period(session: Session, user_id: int, start: date, end: date) -> int:
+    """Sum of all expense transactions for a user within the date range."""
+    return int(
+        session.scalar(
+            select(func.coalesce(func.sum(Transaction.amount_cents), 0)).where(
+                Transaction.user_id == user_id,
+                Transaction.kind == "expense",
+                Transaction.occurred_on >= start,
+                Transaction.occurred_on <= end,
+            )
+        )
+        or 0
+    )
+
+
+# ── Savings goals ──────────────────────────────────────────────────────────────
+
+def list_goals(session: Session, user_id: int) -> list[SavingsGoal]:
+    return list(
+        session.scalars(
+            select(SavingsGoal)
+            .where(SavingsGoal.user_id == user_id)
+            .order_by(SavingsGoal.created_at.asc())
+        )
+    )
+
+
+def add_goal(session: Session, user_id: int, name: str, target_cents: int) -> SavingsGoal:
+    goal = SavingsGoal(user_id=user_id, name=name.strip(), target_cents=target_cents)
+    session.add(goal)
+    session.flush()
+    return goal
+
+
+def delete_goal(session: Session, goal_id: int, user_id: int) -> bool:
+    goal = session.scalar(
+        select(SavingsGoal).where(
+            SavingsGoal.id == goal_id, SavingsGoal.user_id == user_id
+        )
+    )
+    if goal is None:
+        return False
+    session.delete(goal)
+    return True
+
+
+def deposit_to_goal(
+    session: Session, goal_id: int, user_id: int, amount_cents: int
+) -> SavingsGoal | None:
+    goal = session.scalar(
+        select(SavingsGoal).where(
+            SavingsGoal.id == goal_id, SavingsGoal.user_id == user_id
+        )
+    )
+    if goal is None:
+        return None
+    goal.current_cents = max(0, goal.current_cents + amount_cents)
+    return goal

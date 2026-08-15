@@ -14,7 +14,7 @@ from telegram.ext import Application, ContextTypes, Defaults
 from bot.config import get_settings
 from bot.db import init_db
 from bot.handlers import register_handlers
-from bot.reminders import schedule_all_reminders, schedule_all_weekly_summaries
+from bot.reminders import schedule_all_backups, schedule_all_reminders, schedule_all_weekly_summaries
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -67,12 +67,17 @@ async def post_init(application: Application) -> None:
             BotCommand("budget", "Monthly spending limits"),
             BotCommand("edit", "Edit a past transaction"),
             BotCommand("rate", "Set KHR/USD exchange rate"),
+            BotCommand("trends", "Week vs last week / month vs last"),
+            BotCommand("report", "Custom date range report"),
+            BotCommand("goals", "Savings goals"),
+            BotCommand("backup", "Download a backup now"),
             BotCommand("remind", "Set daily reminder time"),
             BotCommand("cancel", "Stop the current prompt"),
         ]
     )
     schedule_all_reminders(application)
     schedule_all_weekly_summaries(application)
+    schedule_all_backups(application)
 
 
 def main() -> None:

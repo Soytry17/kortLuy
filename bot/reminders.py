@@ -8,9 +8,11 @@ from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes
 
+from io import BytesIO
+
 from bot.db import get_or_create_user, session_scope
 from bot.models import User
-from bot.reports import build_period_report, count_on_date, local_today
+from bot.reports import build_csv, build_period_report, count_on_date, local_today
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +130,71 @@ async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
         text=f"<b>Weekly Summary</b>\n\n{report}",
         parse_mode="HTML",
     )
+
+
+def schedule_user_backup(
+    application: Application,
+    telegram_id: int,
+    timezone_name: str,
+) -> None:
+    job_queue = application.job_queue
+    if job_queue is None:
+        logger.warning("JobQueue is not available; daily backup disabled")
+        return
+
+    name = f"backup_{telegram_id}"
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+    tz = ZoneInfo(timezone_name)
+    job_queue.run_daily(
+        send_daily_backup,
+        time=dtime(hour=23, minute=59, tzinfo=tz),
+        chat_id=telegram_id,
+        name=name,
+        data={"telegram_id": telegram_id, "timezone": timezone_name},
+    )
+    logger.info("Scheduled daily backup for %s at 23:59 %s", telegram_id, timezone_name)
+
+
+def schedule_all_backups(application: Application) -> None:
+    with session_scope() as session:
+        users = list(session.scalars(select(User)))
+        snapshot = [(u.telegram_id, u.timezone) for u in users]
+    for telegram_id, timezone_name in snapshot:
+        schedule_user_backup(application, telegram_id, timezone_name)
+
+
+async def send_daily_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    if job is None or job.chat_id is None:
+        return
+    telegram_id = int(job.chat_id)
+    timezone_name = "Asia/Phnom_Penh"
+    if job.data and isinstance(job.data, dict):
+        timezone_name = str(job.data.get("timezone") or timezone_name)
+
+    with session_scope() as session:
+        user = get_or_create_user(session, telegram_id)
+        today = local_today(user.timezone)
+        data = build_csv(session, user.id)
+        tx_count = data.count(b"\n") - 1  # subtract header row
+
+    if tx_count <= 0:
+        return  # nothing to back up yet
+
+    filename = f"backup_{today.isoformat()}.csv"
+    caption = (
+        f"Daily backup  —  {today.strftime('%d %b %Y')}\n"
+        f"{tx_count} transaction(s) total."
+    )
+    await context.bot.send_document(
+        chat_id=telegram_id,
+        document=BytesIO(data),
+        filename=filename,
+        caption=caption,
+    )
+    logger.info("Sent daily backup to %s (%d rows)", telegram_id, tx_count)
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -23,12 +23,15 @@ class Base(DeclarativeBase):
 class CategoryBudget(Base):
     __tablename__ = "category_budgets"
     __table_args__ = (
-        UniqueConstraint("user_id", "category_id", name="uq_budget_user_category"),
+        UniqueConstraint(
+            "user_id", "category_id", "period", name="uq_budget_user_category_period"
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     category_id: Mapped[int] = mapped_column(ForeignKey("categories.id"), index=True)
+    period: Mapped[str] = mapped_column(String(8), default="month")
     amount_cents: Mapped[int] = mapped_column(Integer)
 
     category: Mapped["Category"] = relationship("Category")
@@ -43,6 +46,9 @@ class User(Base):
     remind_at: Mapped[str] = mapped_column(String(5), default="21:00")
     currency: Mapped[str] = mapped_column(String(8), default="USD")
     khr_rate: Mapped[int] = mapped_column(Integer, default=4100)
+    budget_today_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    budget_week_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    budget_month_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -86,3 +92,16 @@ class Transaction(Base):
 
     user: Mapped[User] = relationship(back_populates="transactions")
     category: Mapped[Category | None] = relationship(back_populates="transactions")
+
+
+class SavingsGoal(Base):
+    __tablename__ = "savings_goals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    target_cents: Mapped[int] = mapped_column(Integer)
+    current_cents: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

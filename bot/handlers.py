@@ -25,23 +25,26 @@ from telegram.ext import (
     filters,
 )
 
+from bot.charts import build_goal_chart, build_trends_chart
 from bot.config import get_settings
 from bot.db import (
     add_category,
+    add_goal,
     add_transaction,
     category_usage_count,
-    delete_budget,
+    delete_goal,
+    deposit_to_goal,
     find_category,
-    get_budget,
     get_or_create_user,
     get_transaction,
+    income_expense_for_period,
     last_transaction,
-    list_budgets,
     list_categories,
+    list_goals,
     month_spending_for_category,
     recent_transactions,
     session_scope,
-    set_budget,
+    total_expense_for_period,
 )
 from bot.models import Category, User
 from bot.money import (
@@ -51,17 +54,30 @@ from bot.money import (
     parse_amount_and_currency,
     parse_amount_to_cents,
 )
-from bot.reminders import parse_hhmm, schedule_user_reminder, schedule_user_weekly_summary
+from bot.reminders import (
+    parse_hhmm,
+    schedule_user_backup,
+    schedule_user_reminder,
+    schedule_user_weekly_summary,
+)
 from bot.reports import (
     build_balance_report,
     build_csv,
+    build_custom_range_report,
     build_period_report,
+    build_trends_report,
     local_today,
+    parse_date_input,
     period_range,
+    sum_by_kind,
 )
 
 AMOUNT, CATEGORY, NOTE = range(3)
 EDIT_TX, EDIT_FIELD, EDIT_AMOUNT_NEW, EDIT_CAT_NEW, EDIT_NOTE_NEW = range(3, 8)
+BUDGET_SET_INPUT = 8
+REPORT_START, REPORT_END = 9, 10
+GOAL_NAME, GOAL_AMOUNT = 11, 12
+GOAL_DEPOSIT = 13
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[object]]
@@ -107,6 +123,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("💳 Balance", callback_data="cmd:balance"),
                 InlineKeyboardButton("🎯 Budget", callback_data="cmd:budget"),
+                InlineKeyboardButton("📊 Trends", callback_data="cmd:trends"),
+            ],
+            [
+                InlineKeyboardButton("🏦 Goals", callback_data="cmd:goals"),
                 InlineKeyboardButton("📤 Export", callback_data="cmd:export"),
             ],
         ]
@@ -125,6 +145,12 @@ def category_keyboard(categories: list[tuple[int, str]]) -> InlineKeyboardMarkup
         rows.append(row)
     rows.append([InlineKeyboardButton("✖ Cancel", callback_data="log:cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✖ Cancel", callback_data="log:cancel")]]
+    )
 
 
 def skip_note_keyboard() -> InlineKeyboardMarkup:
@@ -200,52 +226,93 @@ def _maybe_schedule(context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> Non
     if was_new:
         schedule_user_reminder(context.application, telegram_id, remind_at, timezone_name)
         schedule_user_weekly_summary(context.application, telegram_id, timezone_name)
+        schedule_user_backup(context.application, telegram_id, timezone_name)
 
 
 HELP_TEXT = (
-    "<b>Commands</b>\n\n"
     "<b>Log</b>\n"
     "<code>/expense 4.50 food lunch</code>\n"
     "<code>/income 500 salary payday</code>\n"
     "<code>/expense 10000 KHR food</code>  ← KHR auto-converts\n\n"
     "<b>Reports</b>\n"
-    "/today  •  /week  •  /month  •  /balance\n\n"
-    "<b>Budget</b>\n"
-    "/budget — view limits\n"
-    "/budget set expense food 200\n"
-    "/budget del expense food\n\n"
-    "<b>Edit</b>\n"
-    "/edit — change amount, category, or note of a past entry\n\n"
-    "<b>Settings</b>\n"
+    "/today  •  /week  •  /month  •  /balance\n"
+    "/trends — chart: this week vs last week &amp; month vs month\n"
+    "/report — custom date range report\n\n"
+    "<b>Budget &amp; Goals</b>\n"
+    "/budget — daily / weekly / monthly spending limit\n"
+    "/goals — savings goals with progress chart\n\n"
+    "<b>Edit &amp; Settings</b>\n"
+    "/edit — change amount, category, or note of a past entry\n"
     "/categories — list, add, delete\n"
     "/rate 4100 — set KHR per 1 USD\n"
-    "/remind 21:00 — daily ping time\n\n"
+    "/remind 21:00 — daily reminder time\n\n"
     "<b>Other</b>\n"
     "/undo — remove last entry\n"
-    "/export — download CSV\n\n"
-    "<i>Weekly summary sent every Sunday at 20:00.</i>"
+    "/export — download CSV\n"
+    "/backup — download full backup now\n\n"
+    "<i>Daily backup sent at 23:59.  Weekly summary every Sunday 20:00.</i>"
 )
 
 
 def _build_dashboard(
     name: str,
-    income: int,
-    expense: int,
-    net: int,
+    today_inc: int,
+    today_exp: int,
+    month_inc: int,
+    month_exp: int,
+    balance: int,
     currency: str,
     month_label: str,
+    budget_today: int | None,
+    budget_month: int | None,
 ) -> str:
-    net_sign = "+" if net >= 0 else ""
-    return (
-        f"<b>Money Tracker</b>  |  {escape(name)}\n"
-        f"<code>{'─' * 28}</code>\n"
-        f"<b>{escape(month_label)}</b>\n"
-        f"  Income   <b>{format_money(income, currency)}</b>\n"
-        f"  Expense  <b>{format_money(expense, currency)}</b>\n"
-        f"  Net      <b>{net_sign}{format_money(net, currency)}</b>\n"
-        f"<code>{'─' * 28}</code>\n"
-        "Tap a button or type a command."
-    )
+    today_net = today_inc - today_exp
+    today_sign = "+" if today_net >= 0 else ""
+    month_net = month_inc - month_exp
+    month_sign = "+" if month_net >= 0 else ""
+    bal_sign = "+" if balance >= 0 else ""
+
+    lines = [
+        f"👋 <b>Hi {escape(name)}!</b>",
+        "",
+        f"<b>Today</b>",
+    ]
+    if budget_today:
+        used_pct = min(int(today_exp / budget_today * 100), 100)
+        bar = "█" * (used_pct // 10) + "░" * (10 - used_pct // 10)
+        remaining = budget_today - today_exp
+        rem_sign = "" if remaining >= 0 else "-"
+        lines.append(f"  💸 Spent    <b>{format_money(today_exp, currency)}</b>  /  {format_money(budget_today, currency)}")
+        lines.append(f"  {bar}  {used_pct}%  left {rem_sign}{format_money(abs(remaining), currency)}")
+    else:
+        lines.append(f"  💸 Spent    <b>{format_money(today_exp, currency)}</b>")
+    if today_inc > 0:
+        lines.append(f"  💰 Earned   <b>{format_money(today_inc, currency)}</b>")
+    lines.append(f"  Net        <b>{today_sign}{format_money(today_net, currency)}</b>")
+
+    lines += [
+        "",
+        f"<b>{escape(month_label)}</b>",
+    ]
+    if budget_month:
+        used_pct = min(int(month_exp / budget_month * 100), 100)
+        bar = "█" * (used_pct // 10) + "░" * (10 - used_pct // 10)
+        remaining = budget_month - month_exp
+        rem_sign = "" if remaining >= 0 else "-"
+        lines.append(f"  💸 Spent    <b>{format_money(month_exp, currency)}</b>  /  {format_money(budget_month, currency)}")
+        lines.append(f"  {bar}  {used_pct}%  left {rem_sign}{format_money(abs(remaining), currency)}")
+    else:
+        lines.append(f"  💸 Spent    <b>{format_money(month_exp, currency)}</b>")
+    lines.append(f"  💰 Earned   <b>{format_money(month_inc, currency)}</b>")
+    lines.append(f"  Net        <b>{month_sign}{format_money(month_net, currency)}</b>")
+
+    lines += [
+        "",
+        f"💳 <b>All-time balance</b>  <b>{bal_sign}{format_money(balance, currency)}</b>",
+        "",
+        "<i>Tap a button below to get started.</i>",
+    ]
+    return "\n".join(lines)
 
 
 @allowed_only
@@ -256,17 +323,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     with session_scope() as session:
         user = get_or_create_user(session, tg_user.id)
-        start_date, end_date = period_range("month", user.timezone)
-        from bot.reports import fetch_transactions
-        txs = fetch_transactions(session, user.id, start_date, end_date)
-        income = sum(tx.amount_cents for tx in txs if tx.kind == "income")
-        expense = sum(tx.amount_cents for tx in txs if tx.kind == "expense")
-        net = income - expense
-        month_label = end_date.strftime("%B %Y")
+        today = local_today(user.timezone)
+        month_start, month_end = period_range("month", user.timezone)
+
+        today_inc, today_exp = income_expense_for_period(session, user.id, today, today)
+        month_inc, month_exp = income_expense_for_period(session, user.id, month_start, month_end)
+        all_inc, all_exp = sum_by_kind(session, user.id)
+        balance = all_inc - all_exp
+
         currency = user.currency
+        budget_today = user.budget_today_cents
+        budget_month = user.budget_month_cents
+        month_label = month_end.strftime("%B %Y")
 
     first_name = tg_user.first_name or "there"
-    text = _build_dashboard(first_name, income, expense, net, currency, month_label)
+    text = _build_dashboard(
+        first_name,
+        today_inc, today_exp,
+        month_inc, month_exp,
+        balance,
+        currency,
+        month_label,
+        budget_today,
+        budget_month,
+    )
     await reply(update, text, main_keyboard())
     return ConversationHandler.END
 
@@ -307,7 +387,7 @@ async def start_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.clear()
     context.user_data["kind"] = kind
     prompt = "How much did you spend?" if kind == "expense" else "How much did you receive?"
-    await reply(update, prompt, edit=True)
+    await reply(update, prompt, cancel_keyboard(), edit=True)
     return AMOUNT
 
 
@@ -324,7 +404,7 @@ async def begin_log(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: st
             if kind == "expense"
             else "How much did you receive?"
         )
-        await reply(update, prompt)
+        await reply(update, prompt, cancel_keyboard())
         return AMOUNT
     return await _apply_amount_and_rest(update, context, arg_text)
 
@@ -484,23 +564,29 @@ async def _save_transaction(
         original_bit = f"  <i>({context.user_data['original_display']})</i>"
 
     budget_warning = ""
-    if kind == "expense" and category_id is not None:
-        budget = get_budget(session, user.id, category_id)
-        if budget and budget.amount_cents > 0:
-            start, end = period_range("month", user.timezone)
-            spent = month_spending_for_category(session, user.id, category_id, start, end)
-            pct = int(spent / budget.amount_cents * 100)
-            if spent >= budget.amount_cents:
-                budget_warning = (
-                    f"\n\n<b>Budget exceeded!</b> {escape(cat_name)}: "
-                    f"{format_money(spent, user.currency)} / "
-                    f"{format_money(budget.amount_cents, user.currency)} ({pct}%)"
+    if kind == "expense":
+        period_limits = {
+            "today": user.budget_today_cents,
+            "week": user.budget_week_cents,
+            "month": user.budget_month_cents,
+        }
+        period_names = {"today": "Daily", "week": "Weekly", "month": "Monthly"}
+        for chk_period, limit in period_limits.items():
+            if not limit or limit <= 0:
+                continue
+            start, end = period_range(chk_period, user.timezone)
+            spent = total_expense_for_period(session, user.id, start, end)
+            pct = int(spent / limit * 100)
+            plabel = period_names[chk_period]
+            if spent >= limit:
+                budget_warning += (
+                    f"\n\n<b>{plabel} budget exceeded!</b> "
+                    f"{format_money(spent, user.currency)} / {format_money(limit, user.currency)} ({pct}%)"
                 )
             elif pct >= 80:
-                budget_warning = (
-                    f"\n\nBudget at {pct}%: {escape(cat_name)} "
-                    f"{format_money(spent, user.currency)} / "
-                    f"{format_money(budget.amount_cents, user.currency)}"
+                budget_warning += (
+                    f"\n\n{plabel} budget at {pct}%: "
+                    f"{format_money(spent, user.currency)} / {format_money(limit, user.currency)}"
                 )
 
     msg = (
@@ -594,6 +680,39 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.callback_query.message.reply_document(document=document, caption=caption)
     elif update.message:
         await update.message.reply_document(document=document, caption=caption)
+
+
+@allowed_only
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a CSV backup of all transactions on demand."""
+    if update.callback_query:
+        await update.callback_query.answer()
+    assert update.effective_user is not None
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        from bot.reports import local_today, build_csv
+        today = local_today(user.timezone)
+        data = build_csv(session, user.id)
+        tx_count = data.count(b"\n") - 1
+
+    if tx_count <= 0:
+        await reply(update, "No transactions to back up yet.")
+        return
+
+    from io import BytesIO
+    filename = f"backup_{today.isoformat()}.csv"
+    caption = (
+        f"Backup  —  {today.strftime('%d %b %Y')}\n"
+        f"{tx_count} transaction(s) total."
+    )
+    if update.callback_query and update.callback_query.message:
+        await update.callback_query.message.reply_document(
+            document=BytesIO(data), filename=filename, caption=caption
+        )
+    elif update.message:
+        await update.message.reply_document(
+            document=BytesIO(data), filename=filename, caption=caption
+        )
 
 
 @allowed_only
@@ -751,7 +870,15 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     elif action == "budget":
         if update.callback_query:
             await update.callback_query.answer()
-        await _budget_list(update)
+        await _show_budget_overview(update, edit=True)
+    elif action == "trends":
+        await trends_cmd(update, context)
+    elif action == "goals":
+        await goals_cmd(update, context)
+    elif action == "back":
+        if update.callback_query:
+            await update.callback_query.answer()
+        await start(update, context)
 
 
 # ── /rate ─────────────────────────────────────────────────────────────────────
@@ -985,105 +1112,427 @@ async def edit_note_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
+_PERIOD_BUDGET_FIELD = {
+    "today": "budget_today_cents",
+    "week": "budget_week_cents",
+    "month": "budget_month_cents",
+}
+_PERIOD_LABELS = {"today": "Today", "week": "This Week", "month": "This Month"}
+
+
 def _budget_bar(pct: int) -> str:
     filled = min(pct, 100) // 10
     return "█" * filled + "░" * (10 - filled)
 
 
-@allowed_only
-async def budget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args or []
-    if args and args[0].lower() == "set":
-        await _budget_set(update, args[1:])
-        return
-    if args and args[0].lower() in {"del", "delete", "rm"}:
-        await _budget_del(update, args[1:])
-        return
-    await _budget_list(update)
-
-
-async def _budget_list(update: Update) -> None:
-    assert update.effective_user is not None
-    with session_scope() as session:
-        user = get_or_create_user(session, update.effective_user.id)
-        budgets = list_budgets(session, user.id)
-        if not budgets:
-            await reply(
-                update,
-                "<b>Monthly Budgets</b>\n\nNo budgets set.\n\n"
-                "Add one: <code>/budget set expense food 200</code>",
-            )
-            return
-        start, end = period_range("month", user.timezone)
-        lines = ["<b>Monthly Budgets</b>", ""]
-        for b in sorted(budgets, key=lambda x: (x.category.kind, x.category.name)):
-            spent = month_spending_for_category(session, user.id, b.category_id, start, end)
-            pct = int(spent / b.amount_cents * 100) if b.amount_cents else 0
-            bar = _budget_bar(pct)
-            over = " — OVER" if spent > b.amount_cents else ""
-            lines.append(
-                f"<b>{escape(b.category.kind)}/{escape(b.category.name)}</b>{over}\n"
-                f"  {format_money(spent, user.currency)} / "
-                f"{format_money(b.amount_cents, user.currency)} ({pct}%) {bar}"
-            )
-        lines += [
-            "",
-            "Set: <code>/budget set expense food 200</code>",
-            "Delete: <code>/budget del expense food</code>",
+def _budget_overview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📅 Today", callback_data="bset:today"),
+                InlineKeyboardButton("📆 Week", callback_data="bset:week"),
+            ],
+            [
+                InlineKeyboardButton("🗓 Month", callback_data="bset:month"),
+                InlineKeyboardButton("◀ Back", callback_data="cmd:back"),
+            ],
         ]
-    await reply(update, "\n".join(lines))
-
-
-async def _budget_set(update: Update, args: list[str]) -> None:
-    assert update.effective_user is not None
-    if len(args) < 3:
-        await reply(
-            update,
-            "Usage: <code>/budget set expense food 200</code>",
-        )
-        return
-    kind = args[0].lower()
-    if kind not in {"expense", "income"}:
-        await reply(update, "Kind must be <code>expense</code> or <code>income</code>.")
-        return
-    name = args[1].lower()
-    amount_cents = parse_amount_to_cents(args[2])
-    if amount_cents is None:
-        await reply(update, f"Invalid amount: <code>{escape(args[2])}</code>.")
-        return
-    with session_scope() as session:
-        user = get_or_create_user(session, update.effective_user.id)
-        category = find_category(session, name, kind)
-        if category is None:
-            await reply(update, f"No {kind} category named <code>{escape(name)}</code>.")
-            return
-        set_budget(session, user.id, category.id, amount_cents)
-    await reply(
-        update,
-        f"Budget set: <b>{escape(kind)}/{escape(name)}</b> → {format_money(amount_cents)}",
     )
 
 
-async def _budget_del(update: Update, args: list[str]) -> None:
+@allowed_only
+async def budget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show_budget_overview(update)
+
+
+async def _show_budget_overview(update: Update, edit: bool = False) -> None:
     assert update.effective_user is not None
-    if len(args) < 2:
-        await reply(update, "Usage: <code>/budget del expense food</code>")
-        return
-    kind = args[0].lower()
-    name = " ".join(args[1:]).strip()
     with session_scope() as session:
         user = get_or_create_user(session, update.effective_user.id)
-        category = find_category(session, name, kind)
-        if category is None:
-            await reply(update, f"No {kind} category named <code>{escape(name)}</code>.")
-            return
-        removed = delete_budget(session, user.id, category.id)
-    if removed:
-        await reply(update, f"Budget removed for <code>{escape(kind)}/{escape(name)}</code>.")
-    else:
-        await reply(
-            update, f"No budget was set for <code>{escape(kind)}/{escape(name)}</code>."
+        lines = ["<b>Budget</b>", "", "Tap a period to set your spending limit.", ""]
+        for period, field in _PERIOD_BUDGET_FIELD.items():
+            limit = getattr(user, field)
+            label = _PERIOD_LABELS[period]
+            start, end = period_range(period, user.timezone)
+            spent = total_expense_for_period(session, user.id, start, end)
+            if limit:
+                pct = int(spent / limit * 100)
+                bar = _budget_bar(pct)
+                over = "  OVER" if spent > limit else ""
+                lines.append(
+                    f"<b>{label}</b>{over}\n"
+                    f"  {format_money(spent, user.currency)} / {format_money(limit, user.currency)}"
+                    f"  ({pct}%) {bar}"
+                )
+            else:
+                lines.append(f"<b>{label}</b>  —  not set")
+
+    await reply(update, "\n".join(lines), _budget_overview_keyboard(), edit=edit)
+
+
+@allowed_only
+async def budget_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry: user tapped Today / Week / Month to set a budget."""
+    query = update.callback_query
+    assert query is not None and query.data is not None
+    await query.answer()
+    period = query.data.split(":", 1)[1]
+    context.user_data["bperiod"] = period
+
+    assert update.effective_user is not None
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        current = getattr(user, _PERIOD_BUDGET_FIELD[period])
+        currency = user.currency
+
+    label = _PERIOD_LABELS[period]
+    current_str = format_money(current, currency) if current else "not set"
+    remove_row: list[list[InlineKeyboardButton]] = (
+        [[InlineKeyboardButton("🗑 Remove", callback_data=f"bdel:{period}")]] if current else []
+    )
+    keyboard = InlineKeyboardMarkup(
+        remove_row + [[InlineKeyboardButton("✖ Cancel", callback_data="cmd:budget")]]
+    )
+    await reply(
+        update,
+        f"<b>{label} budget</b>\nCurrent: <b>{current_str}</b>\n\n"
+        "Enter your total spending limit:",
+        keyboard,
+        edit=True,
+    )
+    return BUDGET_SET_INPUT
+
+
+@allowed_only
+async def budget_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    assert update.message is not None and update.message.text is not None
+    assert update.effective_user is not None
+    period = str(context.user_data.pop("bperiod", "month"))
+    amount_cents = parse_amount_to_cents(update.message.text.strip())
+    if amount_cents is None:
+        await reply(update, "Couldn't read that. Try like <code>50</code> or <code>200</code>.")
+        return BUDGET_SET_INPUT
+
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        setattr(user, _PERIOD_BUDGET_FIELD[period], amount_cents)
+
+    label = _PERIOD_LABELS[period]
+    await reply(
+        update,
+        f"<b>{label} budget</b> set to <b>{format_money(amount_cents)}</b>.",
+    )
+    await _show_budget_overview(update)
+    return ConversationHandler.END
+
+
+@allowed_only
+async def budget_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    assert query is not None and query.data is not None
+    await query.answer()
+    period = query.data.split(":", 1)[1]
+    context.user_data.pop("bperiod", None)
+
+    assert update.effective_user is not None
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        setattr(user, _PERIOD_BUDGET_FIELD[period], None)
+
+    label = _PERIOD_LABELS[period]
+    await reply(update, f"<b>{label} budget</b> removed.", edit=True)
+    await _show_budget_overview(update)
+    return ConversationHandler.END
+
+
+@allowed_only
+async def budget_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles cancel → return to budget overview."""
+    query = update.callback_query
+    assert query is not None
+    await query.answer()
+    await _show_budget_overview(update, edit=True)
+
+
+# ── /trends ───────────────────────────────────────────────────────────────────
+
+@allowed_only
+async def trends_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.callback_query:
+        await update.callback_query.answer()
+    assert update.effective_user is not None
+
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        from datetime import timedelta
+        from bot.db import income_expense_for_period as _iep
+        today = local_today(user.timezone)
+        week_start = today - timedelta(days=today.weekday())
+        last_week_end = week_start - timedelta(days=1)
+        last_week_start = last_week_end - timedelta(days=6)
+        month_start = today.replace(day=1)
+        last_month_end = month_start - timedelta(days=1)
+        last_month_start = last_month_end.replace(day=1)
+
+        w_inc, w_exp = _iep(session, user.id, week_start, today)
+        lw_inc, lw_exp = _iep(session, user.id, last_week_start, last_week_end)
+        m_inc, m_exp = _iep(session, user.id, month_start, today)
+        lm_inc, lm_exp = _iep(session, user.id, last_month_start, last_month_end)
+
+        text = build_trends_report(session, user.id, user.timezone, user.currency)
+        currency = user.currency
+
+    chart_buf = build_trends_chart(
+        w_inc=w_inc, w_exp=w_exp,
+        lw_inc=lw_inc, lw_exp=lw_exp,
+        m_inc=m_inc, m_exp=m_exp,
+        lm_inc=lm_inc, lm_exp=lm_exp,
+        currency=currency,
+    )
+
+    msg = update.effective_message
+    if msg:
+        await msg.reply_photo(photo=chart_buf, caption="📊 Trends", parse_mode=ParseMode.HTML)
+    await reply(update, text, main_keyboard())
+
+
+# ── /report (custom date range) ───────────────────────────────────────────────
+
+@allowed_only
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    assert update.effective_user is not None
+    args = context.args or []
+    if len(args) >= 2:
+        today = local_today("Asia/Phnom_Penh")
+        start = parse_date_input(args[0], today.year)
+        end = parse_date_input(args[1], today.year)
+        if start and end:
+            with session_scope() as session:
+                user = get_or_create_user(session, update.effective_user.id)
+                text = build_custom_range_report(
+                    session, user.id, start, end, user.timezone, user.currency
+                )
+            await reply(update, text, main_keyboard())
+            return ConversationHandler.END
+    await reply(
+        update,
+        "Enter the <b>start date</b>:\n<code>DD/MM/YYYY</code>  or  <code>YYYY-MM-DD</code>",
+        cancel_keyboard(),
+    )
+    return REPORT_START
+
+
+@allowed_only
+async def report_start_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    assert update.message is not None and update.message.text is not None
+    assert update.effective_user is not None
+    today = local_today("Asia/Phnom_Penh")
+    start = parse_date_input(update.message.text.strip(), today.year)
+    if start is None:
+        await reply(update, "Couldn't read that date. Try <code>01/08/2026</code>.")
+        return REPORT_START
+    context.user_data["report_start"] = start.isoformat()
+    await reply(
+        update,
+        f"Start: <b>{start.strftime('%d %b %Y')}</b>\n\nNow enter the <b>end date</b>:",
+        cancel_keyboard(),
+    )
+    return REPORT_END
+
+
+@allowed_only
+async def report_end_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    assert update.message is not None and update.message.text is not None
+    assert update.effective_user is not None
+    from datetime import date as date_cls
+    today = local_today("Asia/Phnom_Penh")
+    end = parse_date_input(update.message.text.strip(), today.year)
+    if end is None:
+        await reply(update, "Couldn't read that date. Try <code>14/08/2026</code>.")
+        return REPORT_END
+    start = date_cls.fromisoformat(str(context.user_data.pop("report_start", today.isoformat())))
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        text = build_custom_range_report(
+            session, user.id, start, end, user.timezone, user.currency
         )
+    await reply(update, text, main_keyboard())
+    return ConversationHandler.END
+
+
+# ── /goal ─────────────────────────────────────────────────────────────────────
+
+def _goals_keyboard(goals: list) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for g in goals:
+        rows.append([
+            InlineKeyboardButton(f"💰 Deposit  {g.name}", callback_data=f"gdep:{g.id}"),
+            InlineKeyboardButton("🗑", callback_data=f"grem:{g.id}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Add goal", callback_data="gadd")])
+    rows.append([InlineKeyboardButton("◀ Back", callback_data="cmd:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+@allowed_only
+async def goals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.callback_query:
+        await update.callback_query.answer()
+    await _show_goals(update)
+
+
+async def _show_goals(update: Update, edit: bool = False) -> None:
+    assert update.effective_user is not None
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        goals = list_goals(session, user.id)
+        currency = user.currency
+
+    lines = ["<b>Savings Goals</b>", ""]
+    if not goals:
+        lines.append("No goals yet. Tap <b>Add goal</b> to create one.")
+    else:
+        for g in goals:
+            pct = int(g.current_cents / g.target_cents * 100) if g.target_cents else 0
+            pct = min(pct, 100)
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            achieved = "  ✅ Achieved!" if g.current_cents >= g.target_cents else ""
+            lines.append(
+                f"<b>{escape(g.name)}</b>{achieved}\n"
+                f"  {format_money(g.current_cents, currency)} / {format_money(g.target_cents, currency)}"
+                f"  ({pct}%) {bar}"
+            )
+
+    if goals and not edit:
+        chart_buf = build_goal_chart(
+            goals=[
+                {"name": g.name, "current_cents": g.current_cents, "target_cents": g.target_cents}
+                for g in goals
+            ],
+            currency=currency,
+        )
+        msg = update.effective_message
+        if msg:
+            await msg.reply_photo(photo=chart_buf)
+
+    await reply(update, "\n".join(lines), _goals_keyboard(goals), edit=edit)
+
+
+@allowed_only
+async def goal_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    assert query is not None
+    await query.answer()
+    await reply(
+        update,
+        "Enter a name for your goal (e.g. <code>Vacation</code>):",
+        cancel_keyboard(),
+        edit=True,
+    )
+    return GOAL_NAME
+
+
+@allowed_only
+async def goal_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    assert update.message is not None and update.message.text is not None
+    name = update.message.text.strip()
+    if not name or len(name) > 64:
+        await reply(update, "Please enter a short name (max 64 characters).")
+        return GOAL_NAME
+    context.user_data["goal_name"] = name
+    await reply(
+        update,
+        f"Goal: <b>{escape(name)}</b>\n\nEnter the target amount (e.g. <code>500</code>):",
+        cancel_keyboard(),
+    )
+    return GOAL_AMOUNT
+
+
+@allowed_only
+async def goal_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    assert update.message is not None and update.message.text is not None
+    assert update.effective_user is not None
+    amount_cents = parse_amount_to_cents(update.message.text.strip())
+    if amount_cents is None:
+        await reply(update, "Couldn't read that amount. Try like <code>500</code>.")
+        return GOAL_AMOUNT
+    name = str(context.user_data.pop("goal_name", "Goal"))
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        add_goal(session, user.id, name, amount_cents)
+    await reply(
+        update,
+        f"Goal <b>{escape(name)}</b> set to <b>{format_money(amount_cents)}</b>.",
+    )
+    await _show_goals(update)
+    return ConversationHandler.END
+
+
+@allowed_only
+async def goal_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    assert query is not None and query.data is not None
+    await query.answer()
+    assert update.effective_user is not None
+    goal_id = int(query.data.split(":", 1)[1])
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        delete_goal(session, goal_id, user.id)
+    await _show_goals(update, edit=True)
+
+
+@allowed_only
+async def goal_deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    assert query is not None and query.data is not None
+    await query.answer()
+    goal_id = int(query.data.split(":", 1)[1])
+    context.user_data["deposit_goal_id"] = goal_id
+    assert update.effective_user is not None
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        goals = list_goals(session, user.id)
+    goal = next((g for g in goals if g.id == goal_id), None)
+    name = escape(goal.name) if goal else "goal"
+    await reply(
+        update,
+        f"How much do you want to add to <b>{name}</b>?\n<i>E.g. 50, 1.5k, ₭20000</i>",
+        cancel_keyboard(),
+        edit=True,
+    )
+    return GOAL_DEPOSIT
+
+
+@allowed_only
+async def goal_deposit_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    assert update.message is not None and update.message.text is not None
+    assert update.effective_user is not None
+    amount_cents = parse_amount_to_cents(update.message.text.strip())
+    if amount_cents is None or amount_cents <= 0:
+        await reply(update, "Couldn't read that amount. Try like <code>50</code>.")
+        return GOAL_DEPOSIT
+    goal_id = int(context.user_data.pop("deposit_goal_id", 0))
+    with session_scope() as session:
+        user = get_or_create_user(session, update.effective_user.id)
+        goal = deposit_to_goal(session, goal_id, user.id, amount_cents)
+        if goal is None:
+            await reply(update, "Goal not found.")
+            return ConversationHandler.END
+        name = goal.name
+        current = goal.current_cents
+        target = goal.target_cents
+        currency = user.currency
+    pct = min(int(current / target * 100) if target else 0, 100)
+    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+    achieved = "\n\nYou reached your goal!" if current >= target else ""
+    await reply(
+        update,
+        f"Added <b>{format_money(amount_cents, currency)}</b> to <b>{escape(name)}</b>.\n\n"
+        f"{format_money(current, currency)} / {format_money(target, currency)}"
+        f"  ({pct}%) {bar}{achieved}",
+    )
+    await _show_goals(update)
+    return ConversationHandler.END
 
 
 def register_handlers(application: Application) -> None:
@@ -1149,8 +1598,58 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("export", export_cmd))
     application.add_handler(CommandHandler("categories", categories_cmd))
     application.add_handler(CommandHandler("remind", remind_cmd))
+    budget_set_conversation = ConversationHandler(
+        entry_points=[CallbackQueryHandler(budget_set_start, pattern=r"^bset:(today|week|month)$")],
+        states={
+            BUDGET_SET_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, budget_amount_received)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(budget_period_callback, pattern=r"^cmd:budget$"),
+            CallbackQueryHandler(budget_remove_callback, pattern=r"^bdel:(today|week|month)$"),
+        ],
+        allow_reentry=True,
+        name="budget_set_conversation",
+        persistent=False,
+    )
+    application.add_handler(budget_set_conversation)
+
     application.add_handler(CommandHandler("budget", budget_cmd))
     application.add_handler(CommandHandler("rate", rate_cmd))
     application.add_handler(CommandHandler("edit", edit_cmd))
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^cmd:(today|week|month|balance|export|budget)$"))
+    application.add_handler(CommandHandler("backup", backup_cmd))
+    report_conversation = ConversationHandler(
+        entry_points=[CommandHandler("report", report_cmd)],
+        states={
+            REPORT_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_start_received)],
+            REPORT_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_end_received)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern=r"^log:cancel$")],
+        allow_reentry=True,
+        name="report_conversation",
+        persistent=False,
+    )
+    application.add_handler(report_conversation)
+
+    goal_conversation = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(goal_add_start, pattern=r"^gadd$"),
+            CallbackQueryHandler(goal_deposit_start, pattern=r"^gdep:\d+$"),
+        ],
+        states={
+            GOAL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, goal_name_received)],
+            GOAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, goal_amount_received)],
+            GOAL_DEPOSIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, goal_deposit_received)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern=r"^log:cancel$")],
+        allow_reentry=True,
+        name="goal_conversation",
+        persistent=False,
+    )
+    application.add_handler(goal_conversation)
+
+    application.add_handler(CommandHandler("trends", trends_cmd))
+    application.add_handler(CommandHandler("goals", goals_cmd))
+    application.add_handler(CallbackQueryHandler(goal_remove_callback, pattern=r"^grem:\d+$"))
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^cmd:(today|week|month|balance|export|budget|trends|goals|back)$"))
     application.add_handler(CallbackQueryHandler(delete_category_callback, pattern=r"^delcat:\d+$"))

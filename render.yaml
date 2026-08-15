@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: kortluy-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt && python -m alembic upgrade head
+    startCommand: python -m bot.main
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # you fill this in the Render dashboard
+      - key: ALLOWED_USER_IDS
+        sync: false          # comma-separated Telegram user IDs
+      - key: DATABASE_URL
+        fromDatabase:
+          name: kortluy-db
+          property: connectionString
+
+databases:
+  - name: kortluy-db
+    plan: free
