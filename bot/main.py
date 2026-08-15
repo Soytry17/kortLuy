@@ -26,7 +26,14 @@ logger = logging.getLogger(__name__)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error while processing %s", update, exc_info=context.error)
+    from telegram.error import BadRequest, Conflict
+    err = context.error
+    if isinstance(err, BadRequest) and "query is too old" in str(err).lower():
+        return  # harmless: free-tier spin-down caused the button to expire
+    if isinstance(err, Conflict):
+        logger.warning("Conflict: another bot instance is running. Stop the local bot.")
+        return
+    logger.exception("Unhandled error while processing %s", update, exc_info=err)
 
 
 def bind_platform_port() -> None:
