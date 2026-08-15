@@ -74,7 +74,6 @@ async def post_init(application: Application) -> None:
             BotCommand("budget", "Monthly spending limits"),
             BotCommand("edit", "Edit a past transaction"),
             BotCommand("rate", "Set KHR/USD exchange rate"),
-            BotCommand("trends", "Week vs last week / month vs last"),
             BotCommand("report", "Custom date range report"),
             BotCommand("goals", "Savings goals"),
             BotCommand("backup", "Download a backup now"),

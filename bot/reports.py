@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
-from bot.db import income_expense_for_period
 from bot.models import Transaction
 from bot.money import format_money
 
@@ -186,69 +185,6 @@ def build_balance_report(
         ]
     )
 
-
-def _pct_change(curr: int, prev: int) -> str:
-    if prev == 0:
-        return "new" if curr > 0 else "—"
-    pct = int((curr - prev) / prev * 100)
-    sign = "+" if pct >= 0 else ""
-    return f"{sign}{pct}%"
-
-
-def _trend_row(label: str, curr: int, prev: int, currency: str) -> str:
-    diff = curr - prev
-    sign = "+" if diff >= 0 else ""
-    pct = _pct_change(curr, prev)
-    return (
-        f"  {label:<10}"
-        f"  {format_money(curr, currency):>10}"
-        f"  vs  {format_money(prev, currency):>10}"
-        f"  ({sign}{format_money(diff, currency)}  {pct})"
-    )
-
-
-def build_trends_report(
-    session: Session, user_id: int, timezone_name: str, currency: str
-) -> str:
-    today = local_today(timezone_name)
-
-    # This week / last week
-    week_start = today - timedelta(days=today.weekday())
-    last_week_end = week_start - timedelta(days=1)
-    last_week_start = last_week_end - timedelta(days=6)
-
-    w_inc, w_exp = income_expense_for_period(session, user_id, week_start, today)
-    lw_inc, lw_exp = income_expense_for_period(session, user_id, last_week_start, last_week_end)
-
-    # This month / last month
-    month_start = today.replace(day=1)
-    last_month_end = month_start - timedelta(days=1)
-    last_month_start = last_month_end.replace(day=1)
-
-    m_inc, m_exp = income_expense_for_period(session, user_id, month_start, today)
-    lm_inc, lm_exp = income_expense_for_period(session, user_id, last_month_start, last_month_end)
-
-    lines = ["<b>Trends</b>", ""]
-
-    lines.append(
-        f"<b>This week</b>  vs  <b>Last week</b>\n"
-        f"  <i>({_fmt_date(week_start)} – {_fmt_date(today)}"
-        f"  vs  {_fmt_date(last_week_start)} – {_fmt_date(last_week_end)})</i>"
-    )
-    lines.append(_trend_row("Income", w_inc, lw_inc, currency))
-    lines.append(_trend_row("Expense", w_exp, lw_exp, currency))
-    lines.append(_trend_row("Net", w_inc - w_exp, lw_inc - lw_exp, currency))
-
-    lines.append("")
-    lines.append(
-        f"<b>This month</b>  vs  <b>Last month</b>\n"
-        f"  <i>({today.strftime('%B %Y')}  vs  {last_month_end.strftime('%B %Y')})</i>"
-    )
-    lines.append(_trend_row("Income", m_inc, lm_inc, currency))
-    lines.append(_trend_row("Expense", m_exp, lm_exp, currency))
-    lines.append(_trend_row("Net", m_inc - m_exp, lm_inc - lm_exp, currency))
-
-    return "\n".join(lines)
 
 
 def parse_date_input(text: str, current_year: int) -> date | None:

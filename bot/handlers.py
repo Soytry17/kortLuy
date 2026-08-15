@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot.charts import build_goal_chart, build_trends_chart
+from bot.charts import build_goal_chart
 from bot.config import get_settings
 from bot.db import (
     add_category,
@@ -65,7 +65,6 @@ from bot.reports import (
     build_csv,
     build_custom_range_report,
     build_period_report,
-    build_trends_report,
     local_today,
     parse_date_input,
     period_range,
@@ -123,7 +122,6 @@ def main_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("💳 Balance", callback_data="cmd:balance"),
                 InlineKeyboardButton("🎯 Budget", callback_data="cmd:budget"),
-                InlineKeyboardButton("📊 Trends", callback_data="cmd:trends"),
             ],
             [
                 InlineKeyboardButton("🏦 Goals", callback_data="cmd:goals"),
@@ -184,10 +182,11 @@ def delete_category_keyboard(
 
 async def safe_answer(query: object) -> None:
     """Answer a callback query, ignoring 'query too old' errors from free-tier spin-down."""
+    from telegram import CallbackQuery
+    if not isinstance(query, CallbackQuery):
+        return
     try:
-        from telegram import CallbackQuery
-        if isinstance(query, CallbackQuery):
-            await safe_answer(query)
+        await query.answer()
     except BadRequest as e:
         if "query is too old" not in str(e).lower():
             raise
@@ -247,7 +246,6 @@ HELP_TEXT = (
     "<code>/expense 10000 KHR food</code>  ← KHR auto-converts\n\n"
     "<b>Reports</b>\n"
     "/today  •  /week  •  /month  •  /balance\n"
-    "/trends — chart: this week vs last week &amp; month vs month\n"
     "/report — custom date range report\n\n"
     "<b>Budget &amp; Goals</b>\n"
     "/budget — daily / weekly / monthly spending limit\n"
@@ -882,8 +880,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if update.callback_query:
             await safe_answer(update.callback_query)
         await _show_budget_overview(update, edit=True)
-    elif action == "trends":
-        await trends_cmd(update, context)
     elif action == "goals":
         await goals_cmd(update, context)
     elif action == "back":
@@ -1265,47 +1261,6 @@ async def budget_period_callback(update: Update, context: ContextTypes.DEFAULT_T
     await _show_budget_overview(update, edit=True)
 
 
-# ── /trends ───────────────────────────────────────────────────────────────────
-
-@allowed_only
-async def trends_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.callback_query:
-        await safe_answer(update.callback_query)
-    assert update.effective_user is not None
-
-    with session_scope() as session:
-        user = get_or_create_user(session, update.effective_user.id)
-        from datetime import timedelta
-        from bot.db import income_expense_for_period as _iep
-        today = local_today(user.timezone)
-        week_start = today - timedelta(days=today.weekday())
-        last_week_end = week_start - timedelta(days=1)
-        last_week_start = last_week_end - timedelta(days=6)
-        month_start = today.replace(day=1)
-        last_month_end = month_start - timedelta(days=1)
-        last_month_start = last_month_end.replace(day=1)
-
-        w_inc, w_exp = _iep(session, user.id, week_start, today)
-        lw_inc, lw_exp = _iep(session, user.id, last_week_start, last_week_end)
-        m_inc, m_exp = _iep(session, user.id, month_start, today)
-        lm_inc, lm_exp = _iep(session, user.id, last_month_start, last_month_end)
-
-        text = build_trends_report(session, user.id, user.timezone, user.currency)
-        currency = user.currency
-
-    chart_buf = build_trends_chart(
-        w_inc=w_inc, w_exp=w_exp,
-        lw_inc=lw_inc, lw_exp=lw_exp,
-        m_inc=m_inc, m_exp=m_exp,
-        lm_inc=lm_inc, lm_exp=lm_exp,
-        currency=currency,
-    )
-
-    msg = update.effective_message
-    if msg:
-        await msg.reply_photo(photo=chart_buf, caption="📊 Trends", parse_mode=ParseMode.HTML)
-    await reply(update, text, main_keyboard())
-
 
 # ── /report (custom date range) ───────────────────────────────────────────────
 
@@ -1659,8 +1614,7 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(goal_conversation)
 
-    application.add_handler(CommandHandler("trends", trends_cmd))
     application.add_handler(CommandHandler("goals", goals_cmd))
     application.add_handler(CallbackQueryHandler(goal_remove_callback, pattern=r"^grem:\d+$"))
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^cmd:(today|week|month|balance|export|budget|trends|goals|back)$"))
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^cmd:(today|week|month|balance|export|budget|goals|back)$"))
     application.add_handler(CallbackQueryHandler(delete_category_callback, pattern=r"^delcat:\d+$"))
