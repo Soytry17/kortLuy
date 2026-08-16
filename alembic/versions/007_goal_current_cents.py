@@ -16,10 +16,20 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _col_exists(conn, table: str, column: str) -> bool:
+    result = conn.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = :t AND column_name = :c"
+        ),
+        {"t": table, "c": column},
+    )
+    return result.fetchone() is not None
+
+
 def upgrade() -> None:
     conn = op.get_bind()
-    cols = [row[1] for row in conn.execute(sa.text("PRAGMA table_info(savings_goals)"))]
-    if "current_cents" not in cols:
+    if not _col_exists(conn, "savings_goals", "current_cents"):
         op.add_column(
             "savings_goals",
             sa.Column("current_cents", sa.Integer(), nullable=False, server_default="0"),
@@ -27,5 +37,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("savings_goals") as batch_op:
-        batch_op.drop_column("current_cents")
+    op.drop_column("savings_goals", "current_cents")

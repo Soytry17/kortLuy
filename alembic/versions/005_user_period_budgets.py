@@ -16,18 +16,24 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _col_exists(conn, table: str, column: str) -> bool:
+    result = conn.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = :t AND column_name = :c"
+        ),
+        {"t": table, "c": column},
+    )
+    return result.fetchone() is not None
+
+
 def upgrade() -> None:
     conn = op.get_bind()
-    existing = {
-        row[1]
-        for row in conn.execute(sa.text("PRAGMA table_info(users)")).fetchall()
-    }
     for col in ("budget_today_cents", "budget_week_cents", "budget_month_cents"):
-        if col not in existing:
+        if not _col_exists(conn, "users", col):
             op.add_column("users", sa.Column(col, sa.Integer(), nullable=True))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("users") as batch_op:
-        for col in ("budget_today_cents", "budget_week_cents", "budget_month_cents"):
-            batch_op.drop_column(col)
+    for col in ("budget_today_cents", "budget_week_cents", "budget_month_cents"):
+        op.drop_column("users", col)

@@ -105,7 +105,7 @@ def main() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    bind_platform_port()
+    bind_platform_port()  # no-op when PORT is not set (Background Worker)
     application = (
         Application.builder()
         .token(settings.bot_token)

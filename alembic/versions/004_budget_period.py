@@ -16,53 +16,55 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _col_exists(conn, table: str, column: str) -> bool:
+    result = conn.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = :t AND column_name = :c"
+        ),
+        {"t": table, "c": column},
+    )
+    return result.fetchone() is not None
+
+
 def upgrade() -> None:
     conn = op.get_bind()
 
-    # Check existing columns so we can skip ones already applied
-    existing_cols = {
-        row[1]
-        for row in conn.execute(sa.text("PRAGMA table_info(category_budgets)")).fetchall()
-    }
-    period_exists = "period" in existing_cols
+    if not _col_exists(conn, "category_budgets", "period"):
+        op.add_column(
+            "category_budgets",
+            sa.Column(
+                "period",
+                sa.String(length=8),
+                nullable=False,
+                server_default="month",
+            ),
+        )
 
-    # batch_alter_table recreates the table, which is required for SQLite
-    # constraint changes (SQLite doesn't support DROP CONSTRAINT natively).
-    with op.batch_alter_table("category_budgets", recreate="always") as batch_op:
-        if not period_exists:
-            batch_op.add_column(
-                sa.Column(
-                    "period",
-                    sa.String(length=8),
-                    nullable=False,
-                    server_default="month",
-                )
-            )
-        # Drop old constraint if it still exists (ignore if already gone)
-        try:
-            batch_op.drop_constraint("uq_budget_user_category", type_="unique")
-        except Exception:
-            pass
-        # Create new constraint (ignore if already exists)
-        try:
-            batch_op.create_unique_constraint(
-                "uq_budget_user_category_period",
-                ["user_id", "category_id", "period"],
-            )
-        except Exception:
-            pass
+    # Drop old constraint if it exists, create new one
+    try:
+        op.drop_constraint("uq_budget_user_category", "category_budgets", type_="unique")
+    except Exception:
+        pass
+    try:
+        op.create_unique_constraint(
+            "uq_budget_user_category_period",
+            "category_budgets",
+            ["user_id", "category_id", "period"],
+        )
+    except Exception:
+        pass
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("category_budgets", recreate="always") as batch_op:
-        try:
-            batch_op.drop_constraint("uq_budget_user_category_period", type_="unique")
-        except Exception:
-            pass
-        try:
-            batch_op.create_unique_constraint(
-                "uq_budget_user_category", "category_budgets", ["user_id", "category_id"]
-            )
-        except Exception:
-            pass
-        batch_op.drop_column("period")
+    try:
+        op.drop_constraint("uq_budget_user_category_period", "category_budgets", type_="unique")
+    except Exception:
+        pass
+    try:
+        op.create_unique_constraint(
+            "uq_budget_user_category", "category_budgets", ["user_id", "category_id"]
+        )
+    except Exception:
+        pass
+    op.drop_column("category_budgets", "period")
